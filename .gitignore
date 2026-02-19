@@ -1,0 +1,33 @@
+# Android
+*.iml
+.gradle/
+/local.properties
+.idea/
+*.apk
+*.aab
+*.ap_
+*.dex
+/build/
+/app/build/
+/captures
+.externalNativeBuild/
+.cxx/
+
+# Kotlin
+.kotlin/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.env
+venv/
+.venv/
+
+# Claude
+.claude/
+
+# OS
+.DS_Store
+Thumbs.db
