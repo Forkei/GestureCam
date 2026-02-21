@@ -2,8 +2,8 @@
 
 import math
 import time
-from collections import deque
-from dataclasses import dataclass
+from collections import Counter, deque
+from dataclasses import dataclass, field as dataclass_field
 from enum import Enum, auto
 from typing import Dict, List, Optional, Tuple
 
@@ -106,7 +106,6 @@ class FingerAnalyzer:
         # For left hand, thumb tip should be right of thumb IP
         thumb_tip = landmarks[4]
         thumb_ip = landmarks[3]
-        thumb_mcp = landmarks[2]
 
         # Use lateral distance relative to palm width
         palm_width = _distance(landmarks[5], landmarks[17])
@@ -117,21 +116,28 @@ class FingerAnalyzer:
         palm_center_x = (landmarks[0][0] + landmarks[9][0]) / 2
         tip_dist = abs(thumb_tip[0] - palm_center_x)
         ip_dist = abs(thumb_ip[0] - palm_center_x)
-        thumb_extended = tip_dist > ip_dist and (tip_dist - ip_dist) / palm_width > 0.15
+        thumb_extended = tip_dist > ip_dist and (tip_dist - ip_dist) / palm_width > self.config.thumb_extend_min_ratio
         extended.append(thumb_extended)
 
         # Other fingers: tip above PIP (in image coords, y decreases upward)
-        # Also check angle at PIP joint
+        # Also check angle at PIP joint as secondary confirmation
         for i in range(1, 5):
             tip = landmarks[FINGER_TIPS[i]]
             pip = landmarks[FINGER_PIPS[i]]
-            mcp = landmarks[FINGER_MCPS[i]]
+            base = landmarks[FINGER_BASES[i]]
 
             # Primary check: tip is further from wrist than PIP
             wrist = landmarks[WRIST]
             tip_to_wrist = _distance(tip, wrist)
             pip_to_wrist = _distance(pip, wrist)
-            is_extended = tip_to_wrist > pip_to_wrist
+            distance_check = tip_to_wrist > pip_to_wrist
+
+            # Secondary check: PIP joint angle (straight = extended)
+            pip_angle = _angle_3pts(base, pip, tip)
+            angle_check = pip_angle > self.config.finger_extend_threshold
+
+            # Either passing = extended (a truly curled finger fails both)
+            is_extended = distance_check or angle_check
 
             extended.append(is_extended)
 
@@ -157,6 +163,7 @@ class StaticGestureClassifier:
         lm = hand.landmarks_norm
         extended = self.finger_analyzer.fingers_extended(lm, hand.handedness)
         thumb_index_dist = self.finger_analyzer.thumb_index_distance(lm)
+        angles = self.finger_analyzer.finger_angles(lm)
 
         for gdef in self._gesture_defs:
             if not self._matches(gdef, extended, lm, thumb_index_dist):
@@ -165,9 +172,42 @@ class StaticGestureClassifier:
                 gesture = StaticGesture[gdef.name]
             except KeyError:
                 continue
-            return gesture, gdef.confidence
+            confidence = self._compute_confidence(gdef, angles)
+            return gesture, confidence
 
         return StaticGesture.NONE, 0.0
+
+    def _compute_confidence(self, gdef: StaticGestureDef,
+                            angles: List[float]) -> float:
+        """Compute confidence based on how far finger angles are from thresholds.
+
+        Returns a value in [0.5, 1.0]: borderline matches get ~0.5,
+        strong matches get ~1.0.
+        """
+        curl_thresh = self.config.finger_curl_threshold
+        extend_thresh = self.config.finger_extend_threshold
+        midpoint = (curl_thresh + extend_thresh) / 2.0
+        half_range = (extend_thresh - curl_thresh) / 2.0
+        if half_range < 1e-6:
+            return gdef.confidence
+
+        margins = []
+        for i, required in enumerate(gdef.fingers):
+            if required is None:
+                continue
+            angle = angles[i]
+            if required:  # finger should be extended
+                margin = (angle - midpoint) / half_range
+            else:  # finger should be curled
+                margin = (midpoint - angle) / half_range
+            margins.append(max(0.0, min(1.0, margin)))
+
+        if not margins:
+            return gdef.confidence
+
+        avg_margin = sum(margins) / len(margins)
+        # Map [0, 1] margin to [0.5, 1.0] confidence
+        return 0.5 + 0.5 * avg_margin
 
     def _matches(self, gdef: StaticGestureDef, extended: List[bool],
                  lm: List[Tuple[float, float, float]],
@@ -178,18 +218,25 @@ class StaticGestureClassifier:
                 return False
 
         # Check thumb-index closeness
-        if gdef.thumb_index_close is True and thumb_index_dist >= 0.06:
+        close_dist = self.config.thumb_index_close_dist
+        if gdef.thumb_index_close is True and thumb_index_dist >= close_dist:
             return False
-        if gdef.thumb_index_close is False and thumb_index_dist < 0.06:
+        if gdef.thumb_index_close is False and thumb_index_dist < close_dist:
             return False
 
-        # Check thumb direction
+        # Check thumb direction using vector angle (accounts for hand tilt)
         if gdef.thumb_direction is not None:
-            thumb_tip_y = lm[4][1]
-            wrist_y = lm[0][1]
-            if gdef.thumb_direction == "up" and thumb_tip_y >= wrist_y:
+            thumb_tip = lm[4]
+            thumb_mcp = lm[2]
+            dx = thumb_tip[0] - thumb_mcp[0]
+            dy = thumb_tip[1] - thumb_mcp[1]
+            angle_deg = math.degrees(math.atan2(dy, dx))
+            # In image coords: negative y = upward, positive y = downward
+            # "up" requires angle < -30 (pointing upward with 30-degree tolerance)
+            # "down" requires angle > 30 (pointing downward with 30-degree tolerance)
+            if gdef.thumb_direction == "up" and angle_deg >= -30:
                 return False
-            if gdef.thumb_direction == "down" and thumb_tip_y < wrist_y:
+            if gdef.thumb_direction == "down" and angle_deg <= 30:
                 return False
 
         return True
@@ -198,9 +245,11 @@ class StaticGestureClassifier:
 @dataclass
 class _HandHistory:
     """Per-hand rolling buffers for dynamic gesture detection."""
-    palm_positions: deque  # (x_norm, y_norm, timestamp)
-    pinch_distances: deque  # (distance, timestamp)
-    directions: deque  # for wave detection: list of 'L'/'R' direction changes
+    swipe_positions: deque   # (x_norm, y_norm, timestamp) — swipe only
+    circle_positions: deque  # (x_norm, y_norm, timestamp) — circle only
+    wave_positions: deque    # (x_norm, y_norm, timestamp) — wave only
+    pinch_distances: deque   # (distance, timestamp)
+    cooldowns: Dict[str, float] = dataclass_field(default_factory=dict)  # gesture_key -> expiry timestamp
 
 
 class DynamicGestureDetector:
@@ -215,47 +264,77 @@ class DynamicGestureDetector:
         if handedness not in self._histories:
             max_frames = self.config.max_history_frames
             self._histories[handedness] = _HandHistory(
-                palm_positions=deque(maxlen=max_frames),
+                swipe_positions=deque(maxlen=max_frames),
+                circle_positions=deque(maxlen=max_frames),
+                wave_positions=deque(maxlen=max_frames),
                 pinch_distances=deque(maxlen=max_frames),
-                directions=deque(maxlen=max_frames),
             )
         return self._histories[handedness]
 
-    def update(self, hand: HandLandmarks) -> Tuple[DynamicGesture, float]:
+    def _is_on_cooldown(self, hist: _HandHistory, gesture_key: str, now: float) -> bool:
+        """Check if a gesture category is still in cooldown."""
+        return now < hist.cooldowns.get(gesture_key, 0.0)
+
+    def _clear_after_fire(self, gesture_key: str, hist: _HandHistory, now: float):
+        """Clear the relevant history buffer and enter cooldown after a gesture fires."""
+        cooldown = self.config.dynamic_gesture_cooldown_sec
+        hist.cooldowns[gesture_key] = now + cooldown
+        buffers = {
+            "pinch_spread": hist.pinch_distances,
+            "swipe": hist.swipe_positions,
+            "circle": hist.circle_positions,
+            "wave": hist.wave_positions,
+        }
+        buf = buffers.get(gesture_key)
+        if buf is not None:
+            buf.clear()
+
+    def update(self, hand: HandLandmarks,
+               static_gesture: 'StaticGesture' = None) -> Tuple[DynamicGesture, float]:
         """Update history and check for dynamic gestures."""
         now = time.time()
         hist = self._get_history(hand.handedness)
         lm = hand.landmarks_norm
 
-        # Record palm position
-        hist.palm_positions.append((hand.palm_center_norm[0],
-                                    hand.palm_center_norm[1], now))
+        # Record palm position into each gesture's own buffer
+        pos = (hand.palm_center_norm[0], hand.palm_center_norm[1], now)
+        hist.swipe_positions.append(pos)
+        hist.circle_positions.append(pos)
+        hist.wave_positions.append(pos)
 
         # Record pinch distance
         pinch_dist = self.finger_analyzer.thumb_index_distance(lm)
         hist.pinch_distances.append((pinch_dist, now))
 
-        # Check gestures in priority order
-        result = self._check_pinch_spread(hist)
-        if result[0] != DynamicGesture.NONE:
-            return result
+        # Check gestures in priority order, respecting cooldowns
+        if not self._is_on_cooldown(hist, "pinch_spread", now):
+            result = self._check_pinch_spread(hist, static_gesture)
+            if result[0] != DynamicGesture.NONE:
+                self._clear_after_fire("pinch_spread", hist, now)
+                return result
 
-        result = self._check_swipe(hist)
-        if result[0] != DynamicGesture.NONE:
-            return result
+        if not self._is_on_cooldown(hist, "swipe", now):
+            result = self._check_swipe(hist)
+            if result[0] != DynamicGesture.NONE:
+                self._clear_after_fire("swipe", hist, now)
+                return result
 
-        result = self._check_circle(hist)
-        if result[0] != DynamicGesture.NONE:
-            return result
+        if not self._is_on_cooldown(hist, "circle", now):
+            result = self._check_circle(hist)
+            if result[0] != DynamicGesture.NONE:
+                self._clear_after_fire("circle", hist, now)
+                return result
 
-        result = self._check_wave(hist)
-        if result[0] != DynamicGesture.NONE:
-            return result
+        if not self._is_on_cooldown(hist, "wave", now):
+            result = self._check_wave(hist)
+            if result[0] != DynamicGesture.NONE:
+                self._clear_after_fire("wave", hist, now)
+                return result
 
         return DynamicGesture.NONE, 0.0
 
     def _check_swipe(self, hist: _HandHistory) -> Tuple[DynamicGesture, float]:
-        positions = hist.palm_positions
+        positions = hist.swipe_positions
         n = min(len(positions), self.config.swipe_history_frames)
         if n < 3:
             return DynamicGesture.NONE, 0.0
@@ -264,7 +343,7 @@ class DynamicGestureDetector:
         start = recent[0]
         end = recent[-1]
         dt = end[2] - start[2]
-        if dt < 0.05:
+        if dt < self.config.min_dt:
             return DynamicGesture.NONE, 0.0
 
         dx = end[0] - start[0]
@@ -276,6 +355,15 @@ class DynamicGestureDetector:
             return DynamicGesture.NONE, 0.0
         if velocity < self.config.swipe_min_velocity:
             return DynamicGesture.NONE, 0.0
+
+        # Reject diagonal movements: primary axis must dominate secondary
+        ratio = self.config.swipe_direction_ratio
+        if abs(dx) > abs(dy):
+            if abs(dy) > 1e-6 and abs(dx) / abs(dy) < ratio:
+                return DynamicGesture.NONE, 0.0
+        else:
+            if abs(dx) > 1e-6 and abs(dy) / abs(dx) < ratio:
+                return DynamicGesture.NONE, 0.0
 
         confidence = min(1.0, velocity / (self.config.swipe_min_velocity * 2))
 
@@ -291,7 +379,13 @@ class DynamicGestureDetector:
             else:
                 return DynamicGesture.SWIPE_DOWN, confidence
 
-    def _check_pinch_spread(self, hist: _HandHistory) -> Tuple[DynamicGesture, float]:
+    def _check_pinch_spread(self, hist: _HandHistory,
+                            static_gesture: 'StaticGesture' = None) -> Tuple[DynamicGesture, float]:
+        # Gate on compatible static gestures to prevent false triggers during transitions
+        if static_gesture is not None:
+            if static_gesture.name not in self.config.pinch_compatible_gestures:
+                return DynamicGesture.NONE, 0.0
+
         distances = hist.pinch_distances
         n = min(len(distances), self.config.pinch_history_frames)
         if n < 3:
@@ -301,7 +395,7 @@ class DynamicGestureDetector:
         start_dist, start_t = recent[0]
         end_dist, end_t = recent[-1]
         dt = end_t - start_t
-        if dt < 0.05:
+        if dt < self.config.min_dt:
             return DynamicGesture.NONE, 0.0
 
         rate = (end_dist - start_dist) / dt
@@ -319,7 +413,7 @@ class DynamicGestureDetector:
         return DynamicGesture.NONE, 0.0
 
     def _check_circle(self, hist: _HandHistory) -> Tuple[DynamicGesture, float]:
-        positions = hist.palm_positions
+        positions = hist.circle_positions
         n = min(len(positions), self.config.circle_history_frames)
         if n < self.config.circle_min_points:
             return DynamicGesture.NONE, 0.0
@@ -334,7 +428,7 @@ class DynamicGestureDetector:
         # Check radius consistency
         radii = [math.sqrt((x - cx)**2 + (y - cy)**2) for x, y in zip(xs, ys)]
         mean_r = sum(radii) / len(radii)
-        if mean_r < 0.02:  # too small to be a circle
+        if mean_r < self.config.circle_min_radius:  # too small to be a circle
             return DynamicGesture.NONE, 0.0
 
         std_r = math.sqrt(sum((r - mean_r)**2 for r in radii) / len(radii))
@@ -365,9 +459,9 @@ class DynamicGestureDetector:
             return DynamicGesture.CIRCLE_CCW, confidence
 
     def _check_wave(self, hist: _HandHistory) -> Tuple[DynamicGesture, float]:
-        positions = hist.palm_positions
+        positions = hist.wave_positions
         n = min(len(positions), self.config.wave_history_frames)
-        if n < 8:
+        if n < self.config.wave_min_frames:
             return DynamicGesture.NONE, 0.0
 
         recent = list(positions)[-n:]
@@ -381,7 +475,7 @@ class DynamicGestureDetector:
 
         for i in range(1, len(xs)):
             dx = xs[i] - xs[i-1]
-            if abs(dx) < 0.005:
+            if abs(dx) < self.config.wave_deadzone:
                 continue
 
             current_dir = 'R' if dx > 0 else 'L'
@@ -420,8 +514,9 @@ class GestureRecognizer:
     def _apply_hysteresis(self, handedness: str,
                           raw_gesture: StaticGesture,
                           raw_conf: float) -> Tuple[StaticGesture, float]:
-        """Only switch reported gesture when the last N raw frames all agree."""
+        """Switch reported gesture when at least min_agree of N frames agree."""
         n = self.config.gesture_hysteresis_frames
+        min_agree = self.config.gesture_hysteresis_min_agree
         if n <= 1:
             return raw_gesture, raw_conf
 
@@ -430,9 +525,15 @@ class GestureRecognizer:
         history = self._gesture_history[handedness]
         history.append((raw_gesture, raw_conf))
 
-        # Check if all N entries are the same gesture
-        if len(history) == n and all(g == raw_gesture for g, _ in history):
-            self._confirmed_gesture[handedness] = (raw_gesture, raw_conf)
+        if len(history) >= min_agree:
+            # Count most common gesture in the window
+            gesture_counts = Counter(g for g, _ in history)
+            most_common_gesture, count = gesture_counts.most_common(1)[0]
+            if count >= min_agree:
+                # Average confidence across matching frames
+                matching_confs = [c for g, c in history if g == most_common_gesture]
+                avg_conf = sum(matching_confs) / len(matching_confs)
+                self._confirmed_gesture[handedness] = (most_common_gesture, avg_conf)
 
         return self._confirmed_gesture.get(handedness, (StaticGesture.NONE, 0.0))
 
@@ -443,7 +544,9 @@ class GestureRecognizer:
             static_gesture, static_conf = self._apply_hysteresis(
                 hand.handedness, raw_gesture, raw_conf
             )
-            dynamic_gesture, dynamic_conf = self.dynamic_detector.update(hand)
+            dynamic_gesture, dynamic_conf = self.dynamic_detector.update(
+                hand, static_gesture=static_gesture
+            )
 
             results.append(GestureResult(
                 hand_index=i,

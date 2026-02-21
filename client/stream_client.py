@@ -11,7 +11,7 @@ On startup, runs a calibration phase:
 
 Usage:
     python stream_client.py <phone_ip>
-    python stream_client.py 127.0.0.1      (via ADB port forwarding)
+    python stream_client.py <phone_ip> --model path/to/gesture_transformer.pt
 
 Controls:
     SPACE   Toggle auto/manual exposure (lock exposure)
@@ -24,14 +24,14 @@ Controls:
     W       Cycle white balance
     R       Cycle resolution
     J / L   JPEG quality -/+
-    N       Toggle hand tracking
-    M       Toggle gesture-to-camera control
+    N       Toggle hand+pose tracking
     0       Re-calibrate (unlock, settle, re-lock)
     H       Toggle help overlay
     S       Print full status to console
     Q/ESC   Quit
 """
 
+import argparse
 import os
 import sys
 import socket
@@ -39,6 +39,7 @@ import struct
 import json
 import time
 import threading
+from collections import deque
 
 # Suppress Samsung's non-standard JPEG warnings from libjpeg
 if sys.platform == "win32":
@@ -57,11 +58,9 @@ if sys.platform == "win32":
     os.dup2(_stderr_fd, 2)
     os.close(_stderr_fd)
 
-from config import HandTrackingConfig, GestureConfig, VisualizationConfig
+from config import HandTrackingConfig, VisualizationConfig, PoseVisualizationConfig
 from hand_tracker import HandTracker
-from gesture_recognizer import GestureRecognizer, StaticGesture, DynamicGesture
-from gesture_event import GestureEventSystem
-from gesture_mappings import GestureCameraMapper
+from pose_tracker import PoseTracker
 
 # --- Defaults ---
 DEFAULT_RESOLUTION = (640, 480)
@@ -202,6 +201,154 @@ class CameraControl:
         except: pass
 
 
+class GestureClassifier:
+    """Wraps the trained GestureTransformer for live inference.
+
+    Maintains a rolling buffer of feature frames and runs the model
+    periodically to classify the current gesture sequence.
+    """
+
+    def __init__(self, model_path: str, config_path: str = None):
+        import torch
+        from gesture_model import GestureTransformer
+
+        self._torch = torch
+
+        if config_path is None:
+            config_path = os.path.splitext(model_path)[0].replace(
+                "gesture_transformer", "gesture_config") + ".json"
+            # Fallback: same directory
+            if not os.path.isfile(config_path):
+                config_path = os.path.join(os.path.dirname(model_path), "gesture_config.json")
+
+        with open(config_path, "r") as f:
+            cfg = json.load(f)
+
+        self.class_names = cfg["class_names"]
+        self.max_seq_len = cfg["max_seq_len"]
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        self.model = GestureTransformer(
+            input_dim=cfg["input_dim"],
+            num_classes=cfg["num_classes"],
+            d_model=cfg["d_model"],
+            nhead=cfg["nhead"],
+            num_layers=cfg["num_layers"],
+            dim_feedforward=cfg["dim_feedforward"],
+            dropout=cfg["dropout"],
+            max_seq_len=cfg["max_seq_len"],
+        )
+        self.model.load_state_dict(torch.load(model_path, map_location=self.device, weights_only=True))
+        self.model.to(self.device)
+        self.model.eval()
+
+        self._buffer = deque(maxlen=self.max_seq_len)
+
+        # Smoothing: require consecutive agreeing predictions before switching
+        self._raw_label = ""
+        self._raw_conf = 0.0
+        self._consec_label = ""
+        self._consec_count = 0
+        self._display_label = ""
+        self._display_conf = 0.0
+        # Require 2 consecutive same predictions to switch to a new gesture;
+        # switching back to idle is instant (1 prediction).
+        self._switch_threshold = 2
+
+    def push_frame(self, pose, hands):
+        """Extract features from current pose+hand detections and add to buffer."""
+        # Build feature vector matching gesture_dataset.extract_features
+        if pose is not None and pose.world_landmarks:
+            pose_world = np.array(pose.world_landmarks, dtype=np.float32).reshape(-1)
+        else:
+            pose_world = np.zeros(99, dtype=np.float32)
+
+        if pose is not None:
+            pose_vis = np.array(pose.visibility, dtype=np.float32)
+        else:
+            pose_vis = np.zeros(33, dtype=np.float32)
+
+        left_3d = np.zeros(63, dtype=np.float32)
+        right_3d = np.zeros(63, dtype=np.float32)
+        left_present = 0.0
+        right_present = 0.0
+
+        for hand in hands:
+            kp3d = (np.array(hand.landmarks_3d, dtype=np.float32).reshape(-1)
+                    if hand.landmarks_3d else np.zeros(63, dtype=np.float32))
+            if hand.handedness == "Left":
+                left_3d = kp3d
+                left_present = 1.0
+            else:
+                right_3d = kp3d
+                right_present = 1.0
+
+        features = np.concatenate([
+            pose_world,                              # 99
+            left_3d,                                 # 63
+            right_3d,                                # 63
+            np.array([left_present], dtype=np.float32),   # 1
+            np.array([right_present], dtype=np.float32),  # 1
+            pose_vis,                                # 33
+        ])  # total: 260
+
+        self._buffer.append(features)
+
+    def predict(self) -> tuple:
+        """Run inference on the current buffer. Returns (class_name, confidence)."""
+        torch = self._torch
+        if len(self._buffer) < 5:
+            return self._display_label, self._display_conf
+
+        with torch.no_grad():
+            frames = np.stack(list(self._buffer))  # (T, 260)
+            T = frames.shape[0]
+
+            padded = np.zeros((self.max_seq_len, 260), dtype=np.float32)
+            length = min(T, self.max_seq_len)
+            padded[:length] = frames[-length:]
+
+            mask = np.zeros(self.max_seq_len, dtype=np.float32)
+            mask[:length] = 1.0
+
+            x = torch.from_numpy(padded).unsqueeze(0).to(self.device)
+            m = torch.from_numpy(mask).unsqueeze(0).to(self.device)
+
+            logits = self.model(x, m)
+            probs = torch.softmax(logits, dim=1)
+            conf, idx = probs.max(dim=1)
+
+        self._raw_label = self.class_names[idx.item()]
+        self._raw_conf = conf.item()
+
+        # Smoothing: track consecutive same predictions
+        if self._raw_label == self._consec_label:
+            self._consec_count += 1
+        else:
+            self._consec_label = self._raw_label
+            self._consec_count = 1
+
+        # Determine if we switch the displayed label
+        if self._raw_label == self._display_label:
+            # Same as current display — just update confidence
+            self._display_conf = self._raw_conf
+        elif self._consec_count >= self._switch_threshold:
+            # New gesture confirmed after enough consecutive predictions
+            self._display_label = self._raw_label
+            self._display_conf = self._raw_conf
+
+        return self._display_label, self._display_conf
+
+    def clear(self):
+        self._buffer.clear()
+        self._raw_label = ""
+        self._raw_conf = 0.0
+        self._consec_label = ""
+        self._consec_count = 0
+        self._display_label = ""
+        self._display_conf = 0.0
+
+
 def calibrate(ctrl: CameraControl, stream_sock: socket.socket):
     """Run auto for a few seconds, then lock everything."""
     print(f"\n--- CALIBRATION ---")
@@ -215,20 +362,7 @@ def calibrate(ctrl: CameraControl, stream_sock: socket.socket):
     ctrl.set_wb(DEFAULT_WB)
 
     print(f"Auto-exposure/focus settling for {CALIBRATION_SECONDS}s...")
-
-    # Drain frames during calibration
-    start = time.time()
-    frames = 0
-    while time.time() - start < CALIBRATION_SECONDS:
-        try:
-            length_bytes = recv_exact(stream_sock, 4)
-            length = struct.unpack(">I", length_bytes)[0]
-            recv_exact(stream_sock, length)
-            frames += 1
-        except:
-            break
-
-    print(f"  ({frames} frames during calibration)")
+    time.sleep(CALIBRATION_SECONDS)
 
     # Read what auto settled on
     auto_vals = ctrl.get_auto_values()
@@ -306,16 +440,28 @@ def draw_hud(frame, state, show_help):
         ht_color = green if hands_n > 0 else yellow
         cv2.putText(frame, f"Hands: {hands_n}", (w - 130, 50), font, 0.5, ht_color, 1)
 
-        gesture_label = state.get("current_gesture", "")
-        if gesture_label:
-            cv2.putText(frame, gesture_label, (w - 300, 75), font, 0.5, yellow, 1)
+        pose_on = state.get("pose_detected", False)
+        pose_color = (255, 0, 255) if pose_on else (128, 128, 128)
+        pose_text = "Pose: YES" if pose_on else "Pose: NO"
+        cv2.putText(frame, pose_text, (w - 130, 75), font, 0.5, pose_color, 1)
 
-        gc_on = state.get("gesture_control_enabled", False)
-        gc_color = green if gc_on else (128, 128, 128)
-        gc_text = "Gesture Ctrl: ON" if gc_on else "Gesture Ctrl: OFF"
-        cv2.putText(frame, gc_text, (w - 200, 100), font, 0.45, gc_color, 1)
+        # Gesture model prediction (bottom-right corner)
+        gesture_label = state.get("predicted_gesture", "")
+        gesture_conf = state.get("predicted_confidence", 0.0)
+        if gesture_label:
+            g_text = f"{gesture_label} ({gesture_conf:.0%})"
+            text_size = cv2.getTextSize(g_text, font, 0.8, 2)[0]
+            gx = w - text_size[0] - 15
+            gy = h - 20
+            overlay_g = frame.copy()
+            cv2.rectangle(overlay_g, (gx - 8, gy - text_size[1] - 8),
+                          (gx + text_size[0] + 8, gy + 8), (0, 0, 0), -1)
+            cv2.addWeighted(overlay_g, 0.6, frame, 0.4, 0, frame)
+            g_color = green if gesture_conf > 0.8 else yellow
+            cv2.putText(frame, g_text, (gx, gy), font, 0.8, g_color, 2)
     else:
         cv2.putText(frame, "Hands: OFF", (w - 130, 50), font, 0.5, (128, 128, 128), 1)
+        cv2.putText(frame, "Pose: OFF", (w - 130, 75), font, 0.5, (128, 128, 128), 1)
 
     if show_help:
         help_lines = [
@@ -330,8 +476,7 @@ def draw_hud(frame, state, show_help):
             "R      Resolution",
             "J/L    JPEG quality -/+",
             "0      Re-calibrate",
-            "N      Toggle hand tracking",
-            "M      Toggle gesture control",
+            "N      Toggle hand+pose tracking",
             "H      Toggle help",
             "Q/ESC  Quit",
         ]
@@ -345,15 +490,25 @@ def draw_hud(frame, state, show_help):
     return frame
 
 
-def main():
-    if len(sys.argv) < 2:
-        print("Usage: python stream_client.py <phone_ip>")
-        print("       python stream_client.py 127.0.0.1")
-        sys.exit(1)
+def parse_args():
+    parser = argparse.ArgumentParser(description="CV Camera Interactive Stream Client")
+    parser.add_argument("host", help="Phone IP address")
+    parser.add_argument("--stream-port", type=int, default=5000)
+    parser.add_argument("--control-port", type=int, default=5001)
+    parser.add_argument(
+        "--model",
+        metavar="PATH",
+        default=None,
+        help="Path to gesture_transformer.pt for live gesture classification",
+    )
+    return parser.parse_args()
 
-    host = sys.argv[1]
-    stream_port = int(sys.argv[2]) if len(sys.argv) > 2 else 5000
-    control_port = int(sys.argv[3]) if len(sys.argv) > 3 else 5001
+
+def main():
+    args = parse_args()
+    host = args.host
+    stream_port = args.stream_port
+    control_port = args.control_port
 
     # Connect control
     print(f"Connecting control to {host}:{control_port}...")
@@ -371,6 +526,22 @@ def main():
     # --- Calibration ---
     cal = calibrate(ctrl, stream_sock)
 
+    # --- Optional gesture classifier ---
+    gesture_clf = None
+    if args.model:
+        model_path = args.model
+        if not os.path.isfile(model_path):
+            print(f"WARNING: Gesture model not found at {model_path}, running without classification")
+        else:
+            print(f"Loading gesture model from {model_path}...")
+            gesture_clf = GestureClassifier(model_path)
+            print(f"  Classes: {gesture_clf.class_names}")
+            print(f"  Device: {gesture_clf.device}")
+
+    # Inference throttle: run model every N frames to keep real-time
+    INFER_EVERY = 2
+    infer_counter = 0
+
     # State tracking
     state = {
         "ae_mode": "manual",
@@ -384,9 +555,10 @@ def main():
         "jpeg_quality": DEFAULT_JPEG_QUALITY,
         "_fps": 0,
         "hand_tracking_enabled": True,
-        "gesture_control_enabled": False,
         "hands_detected": 0,
-        "current_gesture": "",
+        "pose_detected": False,
+        "predicted_gesture": "",
+        "predicted_confidence": 0.0,
     }
 
     ev_val = 0
@@ -402,12 +574,9 @@ def main():
     frame_count = 0
     fps_start = time.time()
 
-    # --- Hand tracking & gesture init ---
+    # --- Hand + pose tracking init ---
     tracker = HandTracker()
-    gesture_recognizer = GestureRecognizer()
-    event_system = GestureEventSystem()
-    gesture_mapper = GestureCameraMapper(ctrl, state, event_system)
-
+    pose_tracker = PoseTracker()
 
     cv2.namedWindow("CV Camera", cv2.WINDOW_NORMAL)
     grabber = FrameGrabber(stream_sock)
@@ -429,49 +598,36 @@ def main():
                 frame_count = 0
                 fps_start = time.time()
 
-            # --- Hand tracking ---
+            # --- Hand + pose tracking ---
             if state["hand_tracking_enabled"]:
                 hands = tracker.process(frame)
                 state["hands_detected"] = len(hands)
 
                 if hands:
-                    gesture_results = gesture_recognizer.recognize(hands)
-                    event_system.process_results(gesture_results)
-
-                    # Build label from first hand's gestures
-                    labels = []
-                    for gr in gesture_results:
-                        if gr.static_gesture != StaticGesture.NONE:
-                            labels.append(gr.static_gesture.name)
-                        if gr.dynamic_gesture != DynamicGesture.NONE:
-                            labels.append(gr.dynamic_gesture.name)
-                    state["current_gesture"] = " | ".join(labels) if labels else ""
-
-                    # Draw overlays
                     tracker.draw(frame, hands)
 
-                    # Draw gesture labels above each hand
-                    for i, (hand, gr) in enumerate(zip(hands, gesture_results)):
-                        bx, by, bw, bh = hand.bounding_box
-                        label_parts = []
-                        if gr.static_gesture != StaticGesture.NONE:
-                            label_parts.append(gr.static_gesture.name.replace("_", " "))
-                        if gr.dynamic_gesture != DynamicGesture.NONE:
-                            label_parts.append(gr.dynamic_gesture.name.replace("_", " "))
-                        if label_parts:
-                            label = " | ".join(label_parts)
-                            text_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
-                            tx = bx + (bw - text_size[0]) // 2
-                            ty = by - 25
-                            cv2.rectangle(frame, (tx - 4, ty - text_size[1] - 4),
-                                          (tx + text_size[0] + 4, ty + 4), (0, 0, 0), -1)
-                            cv2.putText(frame, label, (tx, ty),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-                else:
-                    state["current_gesture"] = ""
+                # Pose tracking
+                pose = pose_tracker.process(frame)
+                state["pose_detected"] = pose is not None
+                if pose:
+                    pose_tracker.draw(frame, pose)
+
+                # --- Gesture classification ---
+                if gesture_clf is not None:
+                    gesture_clf.push_frame(pose, hands)
+                    infer_counter += 1
+                    if infer_counter >= INFER_EVERY:
+                        infer_counter = 0
+                        label, conf = gesture_clf.predict()
+                        state["predicted_gesture"] = label
+                        state["predicted_confidence"] = conf
             else:
                 state["hands_detected"] = 0
-                state["current_gesture"] = ""
+                state["pose_detected"] = False
+                if gesture_clf is not None:
+                    gesture_clf.clear()
+                    state["predicted_gesture"] = ""
+                    state["predicted_confidence"] = 0.0
 
             frame = draw_hud(frame, state, show_help)
             cv2.imshow("CV Camera", frame)
@@ -580,13 +736,11 @@ def main():
                 zoom_val = min(zoom_val + 0.5, 8.0)
                 ctrl.set_zoom(zoom_val)
                 state["zoom"] = zoom_val
-                gesture_mapper.sync_state()
 
             elif key == ord('x'):
                 zoom_val = max(zoom_val - 0.5, 1.0)
                 ctrl.set_zoom(zoom_val)
                 state["zoom"] = zoom_val
-                gesture_mapper.sync_state()
 
             elif key == ord('w'):
                 wb_idx = (wb_idx + 1) % len(WB_MODES)
@@ -616,14 +770,7 @@ def main():
             elif key == ord('n'):
                 state["hand_tracking_enabled"] = not state["hand_tracking_enabled"]
                 status = "ON" if state["hand_tracking_enabled"] else "OFF"
-                print(f"[Hand Tracking] {status}")
-                if not state["hand_tracking_enabled"]:
-                    gesture_recognizer.clear()
-
-            elif key == ord('m'):
-                gesture_mapper.sync_state()
-                enabled = gesture_mapper.toggle()
-                state["gesture_control_enabled"] = enabled
+                print(f"[Hand+Pose Tracking] {status}")
 
             elif key == ord('s'):
                 s = ctrl.get_status()
@@ -636,6 +783,7 @@ def main():
     finally:
         grabber.stop()
         tracker.close()
+        pose_tracker.close()
         stream_sock.close()
         ctrl.close()
         cv2.destroyAllWindows()

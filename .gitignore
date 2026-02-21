@@ -16,6 +16,9 @@
 # Kotlin
 .kotlin/
 
+# MediaPipe models (download separately)
+*.task
+
 # Python
 __pycache__/
 *.py[cod]

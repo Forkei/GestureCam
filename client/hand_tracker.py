@@ -7,7 +7,7 @@ Models auto-download from HuggingFace on first run.
 """
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 import logging
@@ -34,6 +34,8 @@ class HandLandmarks:
     palm_center: Tuple[int, int] = (0, 0)
     palm_center_norm: Tuple[float, float] = (0.0, 0.0)
     bounding_box: Tuple[int, int, int, int] = (0, 0, 0, 0)  # x,y,w,h
+    # 21 landmarks in 3D space (from WiLoR pred_keypoints_3d)
+    landmarks_3d: List[Tuple[float, float, float]] = field(default_factory=list)
 
 
 class HandTracker:
@@ -143,6 +145,16 @@ class HandTracker:
             for x_px, y_px in kp2d:
                 raw_norm.append((float(x_px) / w, float(y_px) / h, 0.0))
 
+            # Extract 3D keypoints
+            kp3d_raw = out["wilor_preds"].get("pred_keypoints_3d")
+            if kp3d_raw is not None:
+                if hasattr(kp3d_raw, 'cpu'):
+                    kp3d_raw = kp3d_raw.cpu().numpy()
+                landmarks_3d = [(float(x), float(y), float(z))
+                                for x, y, z in kp3d_raw[0]]
+            else:
+                landmarks_3d = []
+
             # Apply EMA smoothing
             landmarks_norm, landmarks_px = self._smooth_landmarks(handedness, raw_norm, w, h)
 
@@ -171,6 +183,7 @@ class HandTracker:
                 palm_center=palm_px,
                 palm_center_norm=palm_norm,
                 bounding_box=(bx, by, bw, bh),
+                landmarks_3d=landmarks_3d,
             )
             detected_hands[handedness] = hand
 

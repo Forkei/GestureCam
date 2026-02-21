@@ -1,0 +1,20 @@
+{
+  "class_names": [
+    "idle",
+    "invalid",
+    "sword_draw"
+  ],
+  "label_map": {
+    "idle": 0,
+    "invalid": 1,
+    "sword_draw": 2
+  },
+  "input_dim": 260,
+  "max_seq_len": 30,
+  "num_classes": 3,
+  "d_model": 128,
+  "nhead": 4,
+  "num_layers": 3,
+  "dim_feedforward": 256,
+  "dropout": 0.3
+}
