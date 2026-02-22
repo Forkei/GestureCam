@@ -6,5 +6,12 @@
   "place_block",
   "invalid",
   "draw_bow",
-  "walking+crouching"
+  "walking+crouching",
+  "crouching",
+  "draw_bowpluscrouching",
+  "swing",
+  "jump",
+  "jumppluscrouch",
+  "jumpplusswing",
+  "throw"
 ]

@@ -28,6 +28,16 @@ __pycache__/
 venv/
 .venv/
 
+# Training data & recordings (too large for git)
+client/recordings/
+client/recordings_control/
+client/recordings_gameplay/
+*.npz
+*.mp4
+
+# Model weights (too large for git)
+client/models/*.pt
+
 # Claude
 .claude/
 

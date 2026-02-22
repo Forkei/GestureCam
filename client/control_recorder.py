@@ -156,18 +156,23 @@ class MCCTPControlCapture:
         controls[CTRL_STRAFE_LEFT] = float(side > 0)
         controls[CTRL_STRAFE_RIGHT] = float(side < 0)
 
-        controls[CTRL_SPRINT] = float(d.get("sprint",
-                                             d.get("is_sprinting", False)))
-        controls[CTRL_SNEAK] = float(d.get("sneak",
-                                            d.get("is_sneaking", False)))
-        controls[CTRL_JUMP] = float(d.get("jump",
-                                           d.get("jumping", False)))
+        controls[CTRL_SPRINT] = float(d.get("input_sprint",
+                                             d.get("sprint",
+                                             d.get("is_sprinting", False))))
+        controls[CTRL_SNEAK] = float(d.get("input_sneak",
+                                            d.get("sneak",
+                                            d.get("is_sneaking", False))))
+        controls[CTRL_JUMP] = float(d.get("input_jump",
+                                           d.get("jump",
+                                           d.get("jumping", False))))
 
         # --- Combat ---
-        controls[CTRL_ATTACK] = float(d.get("attack",
-                                             d.get("attacking", False)))
-        controls[CTRL_USE_ITEM] = float(d.get("use_item",
-                                               d.get("using_item", False)))
+        controls[CTRL_ATTACK] = float(d.get("input_attack",
+                                             d.get("attack",
+                                             d.get("attacking", False))))
+        controls[CTRL_USE_ITEM] = float(d.get("input_use_item",
+                                               d.get("use_item",
+                                               d.get("using_item", False))))
 
         # --- Look (yaw/pitch deltas in game units) ---
         if "yaw_delta" in d:
@@ -203,10 +208,13 @@ class MCCTPControlCapture:
             self._prev_pitch = curr_pitch
 
         # --- Utility ---
-        controls[CTRL_DROP_ITEM] = float(d.get("drop",
-                                                d.get("drop_item", False)))
-        controls[CTRL_SWAP_OFFHAND] = float(d.get("swap_offhand", False))
-        controls[CTRL_OPEN_INVENTORY] = float(d.get("open_inventory", False))
+        controls[CTRL_DROP_ITEM] = float(d.get("input_drop",
+                                                d.get("drop",
+                                                d.get("drop_item", False))))
+        controls[CTRL_SWAP_OFFHAND] = float(d.get("input_swap_offhand",
+                                                    d.get("swap_offhand", False)))
+        controls[CTRL_OPEN_INVENTORY] = float(d.get("input_open_inventory",
+                                                      d.get("open_inventory", False)))
 
         # --- Hotbar (one-hot on change) ---
         current_slot = int(d.get("selected_slot",

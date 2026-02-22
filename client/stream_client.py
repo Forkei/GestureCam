@@ -25,6 +25,8 @@ Controls:
     R       Cycle resolution
     J / L   JPEG quality -/+
     N       Toggle hand+pose tracking
+    B       Toggle game bridge on/off
+    P       Toggle policy debug overlay
     0       Re-calibrate (unlock, settle, re-lock)
     H       Toggle help overlay
     S       Print full status to console
@@ -61,6 +63,8 @@ if sys.platform == "win32":
 from config import HandTrackingConfig, VisualizationConfig, PoseVisualizationConfig
 from hand_tracker import HandTracker
 from pose_tracker import PoseTracker
+from look_joystick import LookJoystick
+from strafe_detector import StrafeDetector
 
 # --- Defaults ---
 DEFAULT_RESOLUTION = (640, 480)
@@ -202,35 +206,51 @@ class CameraControl:
 
 
 class GestureClassifier:
-    """Wraps the trained GestureTransformer for live inference.
+    """Wraps the trained GestureTransformer for live multi-label inference.
 
     Maintains a rolling buffer of feature frames and runs the model
-    periodically to classify the current gesture sequence.
+    periodically to classify the current gesture sequence. Outputs
+    independent sigmoid probabilities per gesture, thresholded to produce
+    a set of active gestures (multiple can fire simultaneously).
+
+    Uses different smoothing strategies for states (sustained gestures like
+    walking/crouching) vs actions (one-shot gestures like jump/swing).
     """
+
+    # Gestures that are sustained states -- use sticky hysteresis
+    _STATE_GESTURES = {"walking", "sprinting", "crouching"}
 
     def __init__(self, model_path: str, config_path: str = None):
         import torch
         from gesture_model import GestureTransformer
+        from gesture_dataset import append_velocity, _POSITION_DIMS
 
         self._torch = torch
+        self._append_velocity = append_velocity
+        self._position_dims = _POSITION_DIMS
 
         if config_path is None:
-            config_path = os.path.splitext(model_path)[0].replace(
-                "gesture_transformer", "gesture_config") + ".json"
-            # Fallback: same directory
-            if not os.path.isfile(config_path):
-                config_path = os.path.join(os.path.dirname(model_path), "gesture_config.json")
+            config_path = os.path.join(os.path.dirname(model_path), "gesture_config.json")
 
         with open(config_path, "r") as f:
             cfg = json.load(f)
 
-        self.class_names = cfg["class_names"]
+        self.gesture_labels = cfg["gesture_labels"]
+        self.num_gestures = cfg["num_gestures"]
+        self.input_dim = cfg["input_dim"]
         self.max_seq_len = cfg["max_seq_len"]
+
+        # Per-gesture thresholds (fall back to single threshold if not available)
+        default_thresh = cfg.get("threshold", 0.5)
+        per_thresh = cfg.get("per_gesture_thresholds", {})
+        self.thresholds = np.array([
+            per_thresh.get(name, default_thresh) for name in self.gesture_labels
+        ], dtype=np.float32)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         self.model = GestureTransformer(
             input_dim=cfg["input_dim"],
-            num_classes=cfg["num_classes"],
+            num_gestures=cfg["num_gestures"],
             d_model=cfg["d_model"],
             nhead=cfg["nhead"],
             num_layers=cfg["num_layers"],
@@ -244,20 +264,22 @@ class GestureClassifier:
 
         self._buffer = deque(maxlen=self.max_seq_len)
 
-        # Smoothing: require consecutive agreeing predictions before switching
-        self._raw_label = ""
-        self._raw_conf = 0.0
-        self._consec_label = ""
-        self._consec_count = 0
-        self._display_label = ""
-        self._display_conf = 0.0
-        # Require 2 consecutive same predictions to switch to a new gesture;
-        # switching back to idle is instant (1 prediction).
-        self._switch_threshold = 2
+        # Classify each gesture as state or action for smoothing
+        self._is_state = np.array([
+            name in self._STATE_GESTURES for name in self.gesture_labels
+        ], dtype=bool)
+
+        # Per-gesture smoothing counters
+        self._consec_active = np.zeros(self.num_gestures, dtype=int)
+        self._consec_inactive = np.zeros(self.num_gestures, dtype=int)
+        self._display_active = np.zeros(self.num_gestures, dtype=bool)
+        self._display_probs = np.zeros(self.num_gestures, dtype=np.float32)
+        # Actions: hold display for N inference cycles after activation
+        self._action_hold = np.zeros(self.num_gestures, dtype=int)
+        self._ACTION_HOLD_FRAMES = 6  # keep action shown for ~12 real frames
 
     def push_frame(self, pose, hands):
         """Extract features from current pose+hand detections and add to buffer."""
-        # Build feature vector matching gesture_dataset.extract_features
         if pose is not None and pose.world_landmarks:
             pose_world = np.array(pose.world_landmarks, dtype=np.float32).reshape(-1)
         else:
@@ -295,18 +317,28 @@ class GestureClassifier:
         self._buffer.append(features)
 
     def predict(self) -> tuple:
-        """Run inference on the current buffer. Returns (class_name, confidence)."""
+        """Run multi-label inference on the current buffer.
+
+        Returns:
+            (active_labels, active_probs): List of active gesture names and
+            their sigmoid probabilities. If no gestures are active, returns
+            (["idle"], [1.0]).
+        """
         torch = self._torch
         if len(self._buffer) < 5:
-            return self._display_label, self._display_conf
+            return self._get_display_output()
 
         with torch.no_grad():
-            frames = np.stack(list(self._buffer))  # (T, 260)
-            T = frames.shape[0]
-
-            padded = np.zeros((self.max_seq_len, 260), dtype=np.float32)
+            raw_frames = np.stack(list(self._buffer))  # (T, 260)
+            T = raw_frames.shape[0]
             length = min(T, self.max_seq_len)
-            padded[:length] = frames[-length:]
+            raw_clip = raw_frames[-length:]  # (length, 260)
+
+            # Compute velocity features from the sequence
+            frames = self._append_velocity(raw_clip)  # (length, 485)
+
+            padded = np.zeros((self.max_seq_len, self.input_dim), dtype=np.float32)
+            padded[:length] = frames
 
             mask = np.zeros(self.max_seq_len, dtype=np.float32)
             mask[:length] = 1.0
@@ -315,38 +347,60 @@ class GestureClassifier:
             m = torch.from_numpy(mask).unsqueeze(0).to(self.device)
 
             logits = self.model(x, m)
-            probs = torch.softmax(logits, dim=1)
-            conf, idx = probs.max(dim=1)
+            probs = torch.sigmoid(logits).squeeze(0).cpu().numpy()  # (num_gestures,)
 
-        self._raw_label = self.class_names[idx.item()]
-        self._raw_conf = conf.item()
+        raw_active = probs > self.thresholds
 
-        # Smoothing: track consecutive same predictions
-        if self._raw_label == self._consec_label:
-            self._consec_count += 1
-        else:
-            self._consec_label = self._raw_label
-            self._consec_count = 1
+        # Per-gesture smoothing with different strategies for states vs actions
+        for g in range(self.num_gestures):
+            if raw_active[g]:
+                self._consec_active[g] += 1
+                self._consec_inactive[g] = 0
+            else:
+                self._consec_inactive[g] += 1
+                self._consec_active[g] = 0
 
-        # Determine if we switch the displayed label
-        if self._raw_label == self._display_label:
-            # Same as current display — just update confidence
-            self._display_conf = self._raw_conf
-        elif self._consec_count >= self._switch_threshold:
-            # New gesture confirmed after enough consecutive predictions
-            self._display_label = self._raw_label
-            self._display_conf = self._raw_conf
+            if self._is_state[g]:
+                # States: sticky hysteresis (2 to activate, 3 to deactivate)
+                if not self._display_active[g] and self._consec_active[g] >= 2:
+                    self._display_active[g] = True
+                elif self._display_active[g] and self._consec_inactive[g] >= 3:
+                    self._display_active[g] = False
+            else:
+                # Actions: fire on 1 strong prediction, hold for N cycles
+                if raw_active[g]:
+                    self._display_active[g] = True
+                    self._action_hold[g] = self._ACTION_HOLD_FRAMES
+                elif self._action_hold[g] > 0:
+                    self._action_hold[g] -= 1
+                else:
+                    self._display_active[g] = False
 
-        return self._display_label, self._display_conf
+            if self._display_active[g]:
+                self._display_probs[g] = probs[g]
+
+        return self._get_display_output()
+
+    def _get_display_output(self) -> tuple:
+        """Return current display state as (labels_list, probs_list)."""
+        active_labels = []
+        active_probs = []
+        for g in range(self.num_gestures):
+            if self._display_active[g]:
+                active_labels.append(self.gesture_labels[g])
+                active_probs.append(float(self._display_probs[g]))
+        if not active_labels:
+            active_labels = ["idle"]
+            active_probs = [1.0]
+        return active_labels, active_probs
 
     def clear(self):
         self._buffer.clear()
-        self._raw_label = ""
-        self._raw_conf = 0.0
-        self._consec_label = ""
-        self._consec_count = 0
-        self._display_label = ""
-        self._display_conf = 0.0
+        self._consec_active[:] = 0
+        self._consec_inactive[:] = 0
+        self._display_active[:] = False
+        self._display_probs[:] = 0.0
+        self._action_hold[:] = 0
 
 
 def calibrate(ctrl: CameraControl, stream_sock: socket.socket):
@@ -382,6 +436,130 @@ def calibrate(ctrl: CameraControl, stream_sock: socket.socket):
         "iso": iso,
         "focus_distance": focus,
     }
+
+
+def draw_control_hud(frame, control_output, show_debug):
+    """Draw control policy state on the frame (bottom-right corner).
+
+    Shows active controls as colored text. When show_debug is True,
+    also shows raw probability bars for each control.
+    """
+    h, w = frame.shape[:2]
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    green = (0, 255, 0)
+    yellow = (0, 255, 255)
+    cyan = (255, 255, 0)
+    red = (0, 0, 255)
+    white = (255, 255, 255)
+    gray = (128, 128, 128)
+
+    if control_output is None:
+        return frame
+
+    # Active controls as colored text (bottom-right)
+    active_labels = []
+    if control_output.forward:   active_labels.append("FWD")
+    if control_output.sprint:    active_labels.append("SPRINT")
+    if control_output.sneak:     active_labels.append("SNEAK")
+    if control_output.strafe_left:  active_labels.append("STR_L")
+    if control_output.strafe_right: active_labels.append("STR_R")
+    if control_output.jump:      active_labels.append("JUMP")
+    if control_output.attack:    active_labels.append("ATK")
+    if control_output.use_item:  active_labels.append("USE")
+
+    if not active_labels:
+        active_labels = ["IDLE"]
+
+    controls_text = " ".join(active_labels)
+    tw = cv2.getTextSize(controls_text, font, 0.7, 2)[0][0]
+
+    # Look indicator text
+    look_text = f"Look: ({control_output.look_yaw:+.2f}, {control_output.look_pitch:+.2f})"
+    ltw = cv2.getTextSize(look_text, font, 0.5, 1)[0][0]
+    max_text_w = max(tw, ltw)
+
+    if show_debug:
+        # Full debug overlay with probability bars
+        bar_names = ["forward", "str_L", "str_R", "sprint",
+                     "sneak", "jump", "attack", "use"]
+        bar_w = 100
+        bar_h = 14
+        line_h = 20
+        panel_w = 80 + bar_w + 60  # name + bar + value
+        panel_h = len(bar_names) * line_h + 70  # bars + controls text + look
+        panel_w = max(panel_w, max_text_w + 20)
+
+        px = w - panel_w - 10
+        py = h - panel_h - 10
+
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (px - 5, py - 5),
+                      (w - 5, h - 5), (0, 0, 0), -1)
+        cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
+
+        # Active controls text at top of panel
+        is_idle = controls_text == "IDLE"
+        ctrl_color = gray if is_idle else green
+        cv2.putText(frame, controls_text, (px + 5, py + 18),
+                    font, 0.6, ctrl_color, 2)
+
+        # Look values
+        look_color = cyan if (abs(control_output.look_yaw) > 0.01
+                              or abs(control_output.look_pitch) > 0.01) else gray
+        cv2.putText(frame, look_text, (px + 5, py + 40),
+                    font, 0.45, look_color, 1)
+
+        # Probability bars
+        probs = control_output.raw_action_probs
+        by = py + 55
+        for i, name in enumerate(bar_names):
+            prob = float(probs[i]) if i < len(probs) else 0.0
+            label_x = px + 5
+            bar_x = px + 70
+            val_x = bar_x + bar_w + 5
+
+            # Name
+            cv2.putText(frame, name, (label_x, by + bar_h - 2),
+                        font, 0.4, white, 1)
+
+            # Background bar
+            cv2.rectangle(frame, (bar_x, by),
+                          (bar_x + bar_w, by + bar_h), (50, 50, 50), -1)
+
+            # Fill bar
+            fill_w = int(prob * bar_w)
+            bar_color = green if prob > 0.5 else yellow if prob > 0.3 else red
+            if fill_w > 0:
+                cv2.rectangle(frame, (bar_x, by),
+                              (bar_x + fill_w, by + bar_h), bar_color, -1)
+
+            # Value text
+            cv2.putText(frame, f"{prob:.2f}", (val_x, by + bar_h - 2),
+                        font, 0.35, white, 1)
+
+            by += line_h
+    else:
+        # Compact display: just active controls and look
+        box_h = 50
+        overlay = frame.copy()
+        cv2.rectangle(overlay,
+                      (w - max_text_w - 30, h - box_h - 10),
+                      (w - 5, h - 5), (0, 0, 0), -1)
+        cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
+
+        is_idle = controls_text == "IDLE"
+        ctrl_color = gray if is_idle else green
+        cv2.putText(frame, controls_text,
+                    (w - max_text_w - 20, h - 35),
+                    font, 0.6, ctrl_color, 2)
+
+        look_color = cyan if (abs(control_output.look_yaw) > 0.01
+                              or abs(control_output.look_pitch) > 0.01) else gray
+        cv2.putText(frame, look_text,
+                    (w - max_text_w - 20, h - 15),
+                    font, 0.45, look_color, 1)
+
+    return frame
 
 
 def draw_hud(frame, state, show_help):
@@ -445,20 +623,44 @@ def draw_hud(frame, state, show_help):
         pose_text = "Pose: YES" if pose_on else "Pose: NO"
         cv2.putText(frame, pose_text, (w - 130, 75), font, 0.5, pose_color, 1)
 
-        # Gesture model prediction (bottom-right corner)
-        gesture_label = state.get("predicted_gesture", "")
-        gesture_conf = state.get("predicted_confidence", 0.0)
-        if gesture_label:
-            g_text = f"{gesture_label} ({gesture_conf:.0%})"
-            text_size = cv2.getTextSize(g_text, font, 0.8, 2)[0]
-            gx = w - text_size[0] - 15
-            gy = h - 20
-            overlay_g = frame.copy()
-            cv2.rectangle(overlay_g, (gx - 8, gy - text_size[1] - 8),
-                          (gx + text_size[0] + 8, gy + 8), (0, 0, 0), -1)
-            cv2.addWeighted(overlay_g, 0.6, frame, 0.4, 0, frame)
-            g_color = green if gesture_conf > 0.8 else yellow
-            cv2.putText(frame, g_text, (gx, gy), font, 0.8, g_color, 2)
+        # Model type indicator
+        model_type = state.get("model_type", None)
+        if model_type == "control":
+            cv2.putText(frame, "Policy", (w - 130, 100), font, 0.5, (0, 200, 255), 1)
+        elif model_type == "gesture":
+            cv2.putText(frame, "Gesture", (w - 130, 100), font, 0.5, (255, 200, 0), 1)
+
+        # Gesture model predictions (bottom-right corner, stacked)
+        # Only show when using gesture classifier (not control policy)
+        if model_type != "control":
+            gesture_labels = state.get("predicted_gestures", [])
+            gesture_probs = state.get("predicted_probs", [])
+            if gesture_labels:
+                line_height = 28
+                g_lines = []
+                for lbl, prob in zip(gesture_labels, gesture_probs):
+                    g_lines.append((f"{lbl} ({prob:.0%})", prob))
+
+                # Measure max width for background box
+                max_tw = 0
+                for g_text, _ in g_lines:
+                    tw = cv2.getTextSize(g_text, font, 0.7, 2)[0][0]
+                    max_tw = max(max_tw, tw)
+
+                box_h = len(g_lines) * line_height + 12
+                gy_base = h - 15
+                gx = w - max_tw - 25
+                overlay_g = frame.copy()
+                cv2.rectangle(overlay_g,
+                              (gx - 8, gy_base - box_h),
+                              (w - 5, gy_base + 5),
+                              (0, 0, 0), -1)
+                cv2.addWeighted(overlay_g, 0.6, frame, 0.4, 0, frame)
+
+                for i, (g_text, prob) in enumerate(reversed(g_lines)):
+                    gy = gy_base - i * line_height
+                    g_color = green if prob > 0.8 else yellow
+                    cv2.putText(frame, g_text, (gx, gy), font, 0.7, g_color, 2)
     else:
         cv2.putText(frame, "Hands: OFF", (w - 130, 50), font, 0.5, (128, 128, 128), 1)
         cv2.putText(frame, "Pose: OFF", (w - 130, 75), font, 0.5, (128, 128, 128), 1)
@@ -477,6 +679,8 @@ def draw_hud(frame, state, show_help):
             "J/L    JPEG quality -/+",
             "0      Re-calibrate",
             "N      Toggle hand+pose tracking",
+            "B      Toggle game bridge",
+            "P      Policy debug overlay",
             "H      Toggle help",
             "Q/ESC  Quit",
         ]
@@ -499,7 +703,18 @@ def parse_args():
         "--model",
         metavar="PATH",
         default=None,
-        help="Path to gesture_transformer.pt for live gesture classification",
+        help="Path to model .pt file (auto-detects gesture vs control policy)",
+    )
+    parser.add_argument(
+        "--game",
+        action="store_true",
+        help="Enable game bridge: send gestures to Minecraft via MCCTP",
+    )
+    parser.add_argument(
+        "--game-port",
+        type=int,
+        default=8765,
+        help="MCCTP WebSocket port (default: 8765)",
     )
     return parser.parse_args()
 
@@ -526,19 +741,32 @@ def main():
     # --- Calibration ---
     cal = calibrate(ctrl, stream_sock)
 
-    # --- Optional gesture classifier ---
+    # --- Optional model (auto-detect: control policy vs gesture classifier) ---
     gesture_clf = None
+    control_policy = None
     if args.model:
         model_path = args.model
         if not os.path.isfile(model_path):
-            print(f"WARNING: Gesture model not found at {model_path}, running without classification")
+            print(f"WARNING: Model not found at {model_path}, running without classification")
         else:
-            print(f"Loading gesture model from {model_path}...")
-            gesture_clf = GestureClassifier(model_path)
-            print(f"  Classes: {gesture_clf.class_names}")
-            print(f"  Device: {gesture_clf.device}")
+            # Auto-detect model type by checking for control_config.json
+            control_config_path = os.path.join(
+                os.path.dirname(model_path), "control_config.json"
+            )
+            if os.path.isfile(control_config_path):
+                from control_policy import ControlPolicy
+                print(f"Loading control policy from {model_path}...")
+                control_policy = ControlPolicy(model_path)
+                print(f"  Input dim: {control_policy.input_dim}")
+                print(f"  Device: {control_policy.device}")
+            else:
+                print(f"Loading gesture model from {model_path}...")
+                gesture_clf = GestureClassifier(model_path)
+                print(f"  Gestures: {gesture_clf.gesture_labels}")
+                print(f"  Device: {gesture_clf.device}")
 
     # Inference throttle: run model every N frames to keep real-time
+    # (only used for gesture classifier; control policy runs every frame)
     INFER_EVERY = 2
     infer_counter = 0
 
@@ -557,8 +785,10 @@ def main():
         "hand_tracking_enabled": True,
         "hands_detected": 0,
         "pose_detected": False,
-        "predicted_gesture": "",
-        "predicted_confidence": 0.0,
+        "predicted_gestures": [],
+        "predicted_probs": [],
+        "model_type": "control" if control_policy else ("gesture" if gesture_clf else None),
+        "control_output": None,
     }
 
     ev_val = 0
@@ -577,6 +807,25 @@ def main():
     # --- Hand + pose tracking init ---
     tracker = HandTracker()
     pose_tracker = PoseTracker()
+    look_joy = LookJoystick()
+    strafe_det = StrafeDetector()
+
+    # --- Optional game bridge ---
+    game_bridge = None
+    control_bridge = None
+    if args.game:
+        if control_policy is not None:
+            from control_bridge import ControlBridge
+            print(f"Connecting control bridge to MCCTP on port {args.game_port}...")
+            control_bridge = ControlBridge(port=args.game_port)
+            control_bridge.connect()
+        else:
+            from game_bridge import GameBridge
+            print(f"Connecting game bridge to MCCTP on port {args.game_port}...")
+            game_bridge = GameBridge(port=args.game_port)
+            game_bridge.connect()
+    game_bridge_active = True
+    show_policy_debug = False
 
     cv2.namedWindow("CV Camera", cv2.WINDOW_NORMAL)
     grabber = FrameGrabber(stream_sock)
@@ -612,24 +861,72 @@ def main():
                 if pose:
                     pose_tracker.draw(frame, pose)
 
-                # --- Gesture classification ---
-                if gesture_clf is not None:
+                if control_policy is not None:
+                    # --- Control policy path ---
+                    # Get game state from MCCTP
+                    game_state = control_bridge.get_game_state() if control_bridge else {}
+
+                    # Push frame to policy
+                    control_policy.push_frame(pose, hands, game_state)
+
+                    # Run inference every frame (policy is lightweight)
+                    output = control_policy.predict()
+                    state["control_output"] = output
+
+                    # Send to Minecraft
+                    if control_bridge is not None and game_bridge_active:
+                        control_bridge.update(output)
+
+                elif gesture_clf is not None:
+                    # --- Gesture classifier path (backward compat) ---
                     gesture_clf.push_frame(pose, hands)
                     infer_counter += 1
                     if infer_counter >= INFER_EVERY:
                         infer_counter = 0
-                        label, conf = gesture_clf.predict()
-                        state["predicted_gesture"] = label
-                        state["predicted_confidence"] = conf
+                        labels, probs = gesture_clf.predict()
+                        state["predicted_gestures"] = labels
+                        state["predicted_probs"] = probs
+
+                    # --- Look joystick (every frame) ---
+                    look_output = look_joy.update(hands)
+                    look_joy.draw(frame, hands)
+
+                    # --- Strafe detector (every frame) ---
+                    strafe_output = strafe_det.update(pose)
+                    strafe_det.draw(frame, pose)
+
+                    # --- Game bridge (send commands to Minecraft) ---
+                    if game_bridge is not None and game_bridge_active:
+                        game_bridge.update(
+                            state.get("predicted_gestures", ["idle"]),
+                            look_output,
+                            strafe_output,
+                        )
             else:
                 state["hands_detected"] = 0
                 state["pose_detected"] = False
+                state["control_output"] = None
+                if control_policy is not None:
+                    control_policy.clear()
+                    # Release control bridge actions when tracking is off
+                    if control_bridge is not None:
+                        control_bridge.release_all()
                 if gesture_clf is not None:
                     gesture_clf.clear()
-                    state["predicted_gesture"] = ""
-                    state["predicted_confidence"] = 0.0
+                    state["predicted_gestures"] = []
+                    state["predicted_probs"] = []
+                # Release game actions when tracking is off
+                if game_bridge is not None:
+                    game_bridge.update(["idle"], None, None)
 
             frame = draw_hud(frame, state, show_help)
+
+            # Control policy HUD (drawn on top of main HUD)
+            if control_policy is not None:
+                frame = draw_control_hud(
+                    frame, state.get("control_output"), show_policy_debug
+                )
+
             cv2.imshow("CV Camera", frame)
             key = cv2.waitKey(1) & 0xFF
 
@@ -772,6 +1069,20 @@ def main():
                 status = "ON" if state["hand_tracking_enabled"] else "OFF"
                 print(f"[Hand+Pose Tracking] {status}")
 
+            elif key == ord('b'):
+                if game_bridge is not None or control_bridge is not None:
+                    game_bridge_active = not game_bridge_active
+                    if not game_bridge_active:
+                        if control_bridge is not None:
+                            control_bridge.release_all()
+                        elif game_bridge is not None:
+                            game_bridge.update(["idle"], None, None)  # release all
+                    print(f"[Game Bridge] {'ON' if game_bridge_active else 'OFF (paused)'}")
+
+            elif key == ord('p'):
+                show_policy_debug = not show_policy_debug
+                print(f"[Policy Debug] {'ON' if show_policy_debug else 'OFF'}")
+
             elif key == ord('s'):
                 s = ctrl.get_status()
                 print(json.dumps(s, indent=2))
@@ -784,6 +1095,10 @@ def main():
         grabber.stop()
         tracker.close()
         pose_tracker.close()
+        if control_bridge is not None:
+            control_bridge.disconnect()
+        if game_bridge is not None:
+            game_bridge.disconnect()
         stream_sock.close()
         ctrl.close()
         cv2.destroyAllWindows()

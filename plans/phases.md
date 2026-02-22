@@ -3,16 +3,16 @@
 ## Completed (v1)
 
 ### Phase 0: MCCTP Game State ✅
-- Basic game state flowing from Minecraft to Python (16 dims)
+- Basic game state flowing from Minecraft to Python (16→24 dims)
 - `encode_game_state()` in control_policy.py
 
 ### Phase 1: Control Recorder ✅
 - `control_recorder.py` — records pose + hands + keyboard/mouse actions
-- pynput-based capture (to be replaced in Phase 5)
+- pynput-based capture (replaced in Phase 6)
 
 ### Phase 2: Dataset & Model ✅
 - `control_dataset.py` — windowed dataset with velocity features
-- `control_model.py` — ControlTransformer (551 input, 10 output, ~755K params)
+- `control_model.py` — ControlTransformer (559 input, 10 output, ~755K params)
 - `bootstrap_controls.py` — converted gesture recordings to control format
 
 ### Phase 3: Training Pipeline ✅
@@ -27,183 +27,144 @@
 
 ---
 
-## New Phases (v2 Expansion)
+## V2 Python Code — Completed ✅ (Phases 6-9)
 
-### Phase 5: Mod Expansion — In-Game Control Capture + Extended Game State
+### Phase 6: Recorder v2 ✅ (code ready, waiting on Phase 5 mod)
+- `control_recorder.py` — MCCTPControlCapture replaces pynput
+- 28-dim control vector, 46-dim game state, v2 .npz format
+- Imports canonical `encode_game_state_v2` from control_policy.py
 
-**Goal**: Update MCCTP Fabric mod to broadcast resolved input state and extended game state.
+### Phase 7: Model v2 ✅
+- `control_model.py` — ControlTransformerV2 (671 input, 5 heads, ~3.51M params)
+- `control_dataset.py` — v2 dataset with mode masks, v1 auto-compat
 
-**Mod changes needed**:
-1. **Resolved input capture** (replaces pynput):
-   - `player.input.movementForward` (float: +forward, -backward)
-   - `player.input.movementSideways` (float: +left, -right)
-   - `player.input.playerInput.jump()`, `.sneak()`, `.sprint()` (bool)
-   - `mc.options.attackKey.isPressed()`, `.useKey.isPressed()` (bool)
-   - Yaw/pitch deltas per tick
-   - `player.getInventory().selectedSlot` (int 0-8)
-   - `mc.options.dropKey.isPressed()`, `.swapHandsKey.isPressed()` (bool)
-   - Screen open state + cursor position + mouse buttons when GUI open
+### Phase 8: Training v2 ✅
+- `train_controls.py` — mode-aware masked loss, 5-head metrics, combined scoring
+- Threshold optimization for action + hotbar + inv_click heads
 
-2. **Extended game state fields** (from 16 → 46 dims):
-   - `player.getAttackCooldownProgress()` — attack cooldown
-   - `player.getVelocity().y` — vertical velocity
-   - `player.getItemUseTimeLeft()` — item use progress
-   - `player.getArmor()` — armor value
-   - Offhand item classification (shield/food/totem/empty)
-   - `mc.crosshairTarget` — entity/block detection + distance
-   - Entity scan: nearest hostile distance, relative yaw, count within 16 blocks
-   - `player.getStatusEffects()` — speed, slowness, strength, DOT, fire resist
-   - `world.getTimeOfDay()`, `player.horizontalCollision`
-   - `mc.currentScreen` — screen type detection
-   - `player.isSwimming()`, `player.isFallFlying()`, `player.isClimbing()`, `player.isOnFire()`
+### Phase 9: Inference + Bridge v2 ✅
+- `control_policy.py` — ControlPolicyV2, ControlOutputV2, encode_game_state_v2
+- `control_bridge.py` — ControlBridgeV2 with mode-aware MCCTP sending
 
-3. **Updated Python mcctp package** to parse new fields from mod broadcast
-
-**Deliverables**:
-- Updated Fabric mod JAR
-- Updated mcctp Python package
-- Test script verifying all 46 game state dims + resolved inputs
-
-**Milestone**: Can run test script → see all fields updating in real-time while playing.
+### Integration fixes ✅
+- Consolidated encode_game_state_v2 to single canonical source (control_policy.py)
+- Unified CTRL_* constants and head groupings via control_dataset.py imports
+- All cross-file interfaces verified (model↔training, dataset↔training, model↔policy)
 
 ---
 
-### Phase 6: Recorder v2 — In-Game Controls + 46-dim Game State
+## Remaining Phases
 
-**Goal**: Rewrite `control_recorder.py` to use in-game control capture instead of pynput.
+### Phase 5: Mod Expansion — CURRENT PRIORITY 🔴
 
-**Changes**:
-1. Remove pynput dependency entirely
-2. Read controls from MCCTP mod broadcast:
-   - Binary actions from resolved input fields
-   - Look from yaw/pitch deltas
-   - Hotbar from slot change detection
-   - Inventory cursor/clicks from mouse state when screen open
-3. Expand `encode_game_state()` from 16 → 46 dims
-4. Record 28-dim control vector per frame
-5. Add mode tracking: gameplay vs screen_open
+**Goal**: Update MCCTP Fabric mod to broadcast resolved player input + extended game state.
 
-**Recording format** (.npz per session):
-```python
-{
-    'frames': (N, 260),        # pose + hands features
-    'controls': (N, 28),       # 28-dim control vector
-    'game_state': (N, 46),     # 46-dim game state
-    'timestamps': (N,),        # frame timestamps
-    'fps': float,              # recording FPS
-}
-```
+**Status**: The v2 Python code is complete and waiting on this. Phase 5 is the critical path.
+
+**Mod repo**: `C:\Users\forke\Documents\CVcoolz\mcctp\`
+
+**What the mod ALREADY broadcasts** (from GameStateCollector):
+- PlayerStateInfo: health, hunger, x/y/z, yaw, pitch, onGround, sprinting, sneaking, swimming, flying, inWater, onFire, fallDistance, velocityY
+- HeldItemInfo: name, category, stackCount, durability (main + offhand)
+- CombatContextInfo: selectedSlot, isUsingItem, isBlocking, activeHand, crosshairTarget, crosshairEntityType, crosshairBlockPos, attackCooldown, itemUseProgress
+
+**What MUST BE ADDED** (grouped by implementation area):
+
+1. **Resolved player input state** (NEW — for recording):
+   - `movementForward` (float): player.input.movementForward
+   - `movementSideways` (float): player.input.movementSideways
+   - `jump` (bool): player.input.playerInput.jump
+   - `sprint` (bool): player.input.playerInput.sprint
+   - `sneak` (bool): player.input.playerInput.sneak
+   - `attack` (bool): mc.options.attackKey.isPressed()
+   - `useItem` (bool): mc.options.useKey.isPressed()
+   - `drop` (bool): mc.options.dropKey.isPressed()
+   - `swapOffhand` (bool): mc.options.swapHandsKey.isPressed()
+   - `openInventory` (bool): mc.options.inventoryKey.isPressed()
+   - `yawDelta` / `pitchDelta` (float): per-tick look deltas
+   - `screenOpen` (bool): mc.currentScreen != null
+   - `screenType` (string): screen class name when open
+   - `cursorX` / `cursorY` (float 0-1): normalized mouse position when screen open
+   - `mouseLeft` / `mouseRight` (bool): mouse button state when screen open
+   - `shiftHeld` (bool): shift key state when screen open
+
+2. **Missing game state fields**:
+   - `armor` (int): player.getArmor()
+   - `isClimbing` (bool): player.isClimbing()
+   - `recentlyHurt` (bool): player.hurtTime > 0
+   - `horizontalCollision` (bool): player.horizontalCollision
+   - `timeOfDay` (long): world.getTimeOfDay()
+   - `gameMode` (string): interactionManager.getCurrentGameMode()
+   - `screenOpenType` (float): 0=none, 0.33=inventory, 0.66=chest, 1.0=other
+
+3. **Status effects** (NEW):
+   - `hasSpeed`, `hasSlowness`, `hasStrength`, `hasFireResist` (bool)
+   - `hasPoison`, `hasWither` (bool) — for taking_dot
+
+4. **Threat scanning** (NEW):
+   - `targetEntityHostile` (bool): is crosshair entity hostile
+   - `targetDistance` (float): distance to crosshair target
+   - `nearestHostileDist` (float): nearest hostile mob distance
+   - `nearestHostileYaw` (float): relative yaw to nearest hostile
+   - `hostileCount` (int): hostile mobs within 16 blocks
+
+5. **New action handlers**:
+   - `cursor` action: set mouse cursor position on open screen
+   - `click` action: mouse click with button param on open screen
+
+6. **Field name normalization**:
+   - Flatten nested offhandItem.category → offhandCategory at root
+   - Flatten nested heldItem.category → heldItemCategory at root
+   - Add snake_case aliases for all camelCase fields
 
 **Deliverables**:
-- Updated `control_recorder.py`
-- Updated `encode_game_state()` (46 dims)
-- Verified recordings with all 28 control dims populated
+- Updated Fabric mod JAR with all fields
+- Updated Python mcctp package (if separate)
+- Test script: `python -c "from mcctp import SyncMCCTPClient; ..."`
 
-**Milestone**: Record a 5-minute session → verify all controls appear in data.
+**Milestone**: Run test → see all 46 game state dims + resolved inputs updating live.
 
 ---
 
-### Phase 7: Model v2 — 5-Head Transformer
+### Phase 10: Data Collection & Training
 
-**Goal**: Expand model architecture to 5 output heads, 671-dim input, ~3.5M params.
-
-**Changes**:
-1. Update `control_model.py`:
-   - Input projection: 671 → 256
-   - Transformer: 6 layers, 8 heads, d_ff=512
-   - 5 output heads: Action(12), Look(2), Hotbar(9), Cursor(2), InvClick(3)
-2. Update `control_dataset.py`:
-   - Load 28-dim controls
-   - Load 46-dim game state
-   - Action history: 28 × 5 = 140 dims
-   - Generate masks: gameplay_mask, screen_open_mask, hotbar_change_mask
-3. Update config format for new dimensions and all 5 head thresholds
-
-**Deliverables**:
-- Updated model definition
-- Updated dataset with mask generation
-- Config schema for v2
-
-**Milestone**: Model instantiates, forward pass produces correct output shapes.
-
----
-
-### Phase 8: Training v2 — Mode-Aware Masked Loss
-
-**Goal**: Training pipeline for the 5-head model with masked losses.
-
-**Changes**:
-1. Update `train_controls.py`:
-   - Mode-aware loss computation (apply masks per head)
-   - Per-control pos_weight for action + inv_click heads
-   - CrossEntropy for hotbar head
-   - Separate metrics per head
-   - Combined score: weighted average of all head metrics
-2. Threshold optimization for all binary controls
-3. Updated training log format
-4. Validation: per-head F1, look MSE, cursor MSE, idle accuracy
-
-**Deliverables**:
-- Updated training script
-- Training log with per-head metrics
-- Optimized thresholds saved in config
-
-**Milestone**: Train on live-recorded data → all 5 heads show learning curves.
-
----
-
-### Phase 9: Inference + Bridge v2 — Full Control Output
-
-**Goal**: Live inference wrapper and MCCTP bridge for all 28 controls.
-
-**Changes**:
-1. Update `control_policy.py`:
-   - 671-dim input assembly
-   - 28-dim output parsing from 5 heads
-   - Action history ring buffer (28 × 5)
-   - Mode switching: gameplay vs inventory based on screen_open
-   - Post-processing: thresholds, hysteresis, EMA smoothing, deadzone
-2. Update `control_bridge.py`:
-   - Send all 28 controls to MCCTP
-   - Hotbar slot commands
-   - Drop item, swap offhand, open inventory
-   - Cursor movement + inventory clicks when screen open
-   - Proper held/pulse edge detection for all controls
-
-**Deliverables**:
-- Updated inference wrapper
-- Updated MCCTP bridge
-- Full control output working in real-time
-
-**Milestone**: Play Minecraft for 2 minutes using only body gestures — move, fight, place blocks, switch hotbar, open inventory.
-
----
-
-### Phase 10: Polish & Optimization
-
-**Goal**: Refine the system for practical daily use.
+**Goal**: Record v2 training data and train the model.
 
 **Tasks**:
-1. **Data augmentation**: Mirror (left/right swap), temporal jitter, noise injection
-2. **Curriculum learning**: Start with movement only → add combat → add inventory
-3. **User calibration**: Quick calibration routine at session start
-4. **Performance profiling**: Ensure <30ms total pipeline latency
-5. **Failure recovery**: Auto-release all actions if tracking lost for >0.5s
-6. **Session management**: Resume recordings, merge datasets
-7. **Visualization**: Debug overlay showing active controls, model confidence, game state
+1. Record 30-60 min of gameplay sessions using v2 recorder
+2. Verify recordings: all 28 control dims populated, game state valid
+3. Run `train_controls.py` — all 5 heads should show learning curves
+4. Evaluate combined score, per-head metrics
+5. Iterate: record more data for weak heads (inventory, hotbar)
 
-**Milestone**: Reliable enough for extended play sessions (30+ minutes).
+**Milestone**: Combined score > 0.6 on validation set.
+
+---
+
+### Phase 11: End-to-End Integration & Polish
+
+**Goal**: Wire everything into stream_client.py and refine for daily use.
+
+**Tasks**:
+1. Update `stream_client.py` to use ControlPolicyV2 + ControlBridgeV2
+2. End-to-end testing: camera → model → Minecraft
+3. Performance profiling (<30ms pipeline latency)
+4. Failure recovery: auto-release if tracking lost
+5. Debug overlay showing controls, confidence, game state
+6. Curriculum learning: movement → combat → inventory
+
+**Milestone**: Play Minecraft for 30+ minutes using only body gestures.
 
 ---
 
 ## Dependency Graph
 
 ```
-Phase 5 (Mod) ──→ Phase 6 (Recorder) ──→ Phase 7 (Model) ──→ Phase 8 (Training)
-                                                                      │
-                                                                      ▼
-                                              Phase 9 (Inference) ──→ Phase 10 (Polish)
+Phase 5 (Mod) ──→ Phase 10 (Record + Train) ──→ Phase 11 (Integration + Polish)
+     🔴                   ⬚                              ⬚
+  CURRENT            needs Phase 5                  needs Phase 10
+
+Phases 6-9 (Python code) ✅ DONE — waiting on Phase 5
 ```
 
-Phase 5 is the critical path — everything else depends on the mod broadcasting
-resolved inputs and extended game state.
+Phase 5 is the ONLY blocker. All Python code is ready.

@@ -802,9 +802,9 @@ def handle_key(key, state):
 
     elif key == KEY_SPACE:
         if state.classes:
-            state.countdown_until = time.time() + 1.0
+            state.countdown_until = time.time() + 3.0
             name = state.classes[state.active_class]
-            print(f"Recording '{name}' in 1...")
+            print(f"Recording '{name}' in 3...")
 
     elif key == KEY_DELETE or key == KEY_BACKSPACE:
         if state.visible:
