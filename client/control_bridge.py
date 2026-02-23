@@ -26,6 +26,7 @@ import time
 from mcctp import SyncMCCTPClient, Actions
 
 from control_policy import ControlOutput, ControlOutputV2
+from control_recorder import flatten_mcctp_state
 
 
 class ControlBridge:
@@ -82,7 +83,7 @@ class ControlBridge:
         is_sneaking, is_blocking, is_using_item, fall_distance.
         """
         try:
-            return self._client.state or {}
+            return flatten_mcctp_state(self._client.state or {})
         except Exception:
             return {}
 
@@ -261,7 +262,7 @@ class ControlBridgeV2:
     def get_game_state(self) -> dict:
         """Query current game state from MCCTP."""
         try:
-            return self._client.state or {}
+            return flatten_mcctp_state(self._client.state or {})
         except Exception:
             return {}
 
